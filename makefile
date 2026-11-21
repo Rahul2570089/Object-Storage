@@ -150,6 +150,10 @@ demo: build
 	kill $$SERVER_PID; \
 	echo "Demo complete!"
 
+.PHONY: crash-test
+crash-test: build
+	@bash ./scripts/crash_test.sh
+
 # Help
 .PHONY: help
 help:
