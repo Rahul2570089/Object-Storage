@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,6 +21,7 @@ var (
 	ErrInvalidName      = errors.New("invalid bucket name or object name")
 	ErrChecksumMismatch = errors.New("checksum mismatch")
 	ErrCorrupt          = errors.New("object data does not match its metadata")
+	ErrBucketNotEmpty   = errors.New("bucket not empty")
 )
 
 type Bucket struct {
@@ -32,6 +34,7 @@ type ObjectStorage struct {
 	metadataDir string
 	tmpDir      string
 	locks       [256]sync.RWMutex
+	bucketMu    sync.RWMutex
 }
 
 type ObjectMetadata struct {
@@ -122,6 +125,12 @@ func (storage *ObjectStorage) PutObject(bucketName, objectKey string, data io.Re
 		LastModified: time.Now(),
 	}
 
+	storage.bucketMu.RLock()
+	defer storage.bucketMu.RUnlock()
+	if !storage.bucketExists(bucketName) {
+		return nil, ErrBucketNotFound
+	}
+
 	mu := storage.lockFor(bucketName, objectKey)
 	mu.Lock()
 	defer mu.Unlock()
@@ -177,6 +186,53 @@ func (storage *ObjectStorage) GetObject(bucketName, objectKey string) (*os.File,
 		return nil, nil, ErrCorrupt
 	}
 	return file, metadata, nil
+}
+
+func (storage *ObjectStorage) DeleteBucket(bucketName string) error {
+	if !validBucket(bucketName) {
+		return ErrInvalidName
+	}
+	storage.bucketMu.Lock()
+	defer storage.bucketMu.Unlock()
+
+	if !storage.bucketExists(bucketName) {
+		return ErrBucketNotFound
+	}
+
+	bucketDir := filepath.Join(storage.dataDir, bucketName)
+	hasFiles := false
+	err := filepath.WalkDir(bucketDir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			hasFiles = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to inspect bucket: %w", err)
+	}
+	if hasFiles {
+		return ErrBucketNotEmpty
+	}
+
+	// Data dir first: an orphaned metadata file is harmless, a data dir
+	// without metadata would show up in ListBuckets with a fake date.
+	if err := os.RemoveAll(bucketDir); err != nil {
+		return fmt.Errorf("failed to delete bucket: %w", err)
+	}
+	if err := os.RemoveAll(filepath.Join(storage.metadataDir, bucketName)); err != nil {
+		return fmt.Errorf("failed to delete bucket metadata: %w", err)
+	}
+	if err := os.Remove(filepath.Join(storage.metadataDir, bucketName+".json")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete bucket metadata: %w", err)
+	}
+	if err := syncDir(storage.dataDir); err != nil {
+		return err
+	}
+	return syncDir(storage.metadataDir)
 }
 
 func (storage *ObjectStorage) Verify(bucketName, objectKey string) error {
@@ -237,6 +293,13 @@ func (storage *ObjectStorage) ListBuckets() ([]Bucket, error) {
 }
 
 func (storage *ObjectStorage) ListObjects(bucketName string) ([]ObjectMetadata, error) {
+	if !validBucket(bucketName) {
+		return nil, ErrInvalidName
+	}
+	if !storage.bucketExists(bucketName) {
+		return nil, ErrBucketNotFound
+	}
+
 	bucketPath := filepath.Join(storage.dataDir, bucketName)
 	var objects []ObjectMetadata
 

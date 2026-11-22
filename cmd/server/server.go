@@ -10,7 +10,7 @@ func main() {
 	storage := NewObjectStorage("./storage")
 	server := NewStorageServer(storage)
 
-	http.HandleFunc("/buckets/", server.handleCreateBucket)
+	http.HandleFunc("/buckets/", server.handleBucket)
 	http.HandleFunc("/buckets", server.handleListBuckets)
 	http.HandleFunc("/objects/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/objects/")
@@ -37,6 +37,7 @@ func main() {
 	log.Println("API endpoints:")
 	log.Println("  PUT /buckets/{name} - Create bucket")
 	log.Println("  GET /buckets - List buckets")
+	log.Println("  DELETE /buckets/{name} - Delete an empty bucket")
 	log.Println("  PUT /objects/{bucket}/{key} - Upload object")
 	log.Println("  GET /objects/{bucket}/{key} - Download object")
 	log.Println("  GET /objects/{bucket} - List objects in bucket")

@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,32 +10,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
 	"time"
 )
 
 const (
 	defaultServerUrl = "http://localhost:8080"
-	version          = "1.0.0"
+	version          = "1.1.0"
 )
 
 type Config struct {
 	ServerUrl string
 	Verbose   bool
+	Quiet     bool
 }
 
-type BucketInfo struct {
-	Name    string    `json:"name"`
-	Created time.Time `json::"created"`
-}
+type usageError struct{ msg string }
 
-type ObjectInfo struct {
-	Key          string    `json:"key"`
-	Size         int64     `json:"size"`
-	ContentType  string    `json:"content_type"`
-	ETag         string    `json:"etag"`
-	LastModified time.Time `json:"last_modified"`
-}
+func (e *usageError) Error() string { return e.msg }
+
+func usagef(format string, a ...any) error { return &usageError{fmt.Sprintf(format, a...)} }
 
 type CLI struct {
 	config *Config
@@ -42,10 +36,30 @@ type CLI struct {
 }
 
 func NewCLI(config *Config) *CLI {
-	return &CLI{
-		config: config,
-		client: &http.Client{Timeout: 30 * time.Second},
+	// No overall http.Client.Timeout: it would also cap the time to stream a
+	// large body and kill big uploads/downloads. Only bound the wait for the
+	// server's response headers.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 60 * time.Second
+	return &CLI{config: config, client: &http.Client{Transport: tr}}
+}
+
+// infof is progress/success output; --quiet silences it.
+func (c *CLI) infof(format string, a ...any) {
+	if !c.config.Quiet {
+		fmt.Printf(format, a...)
 	}
+}
+
+func (c *CLI) debugf(format string, a ...any) {
+	if c.config.Verbose && !c.config.Quiet {
+		fmt.Printf(format, a...)
+	}
+}
+
+// errorf always prints, even with --quiet.
+func (c *CLI) errorf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, format, a...)
 }
 
 func (c *CLI) Run(args []string) error {
@@ -59,12 +73,18 @@ func (c *CLI) Run(args []string) error {
 	switch command {
 	case "mb", "makebucket":
 		return c.makeBucket(commandArgs)
+	case "rb", "removebucket":
+		return c.removeBucket(commandArgs)
 	case "ls", "list":
 		return c.list(commandArgs)
 	case "cp", "copy":
 		return c.copy(commandArgs)
+	case "mv", "move":
+		return c.move(commandArgs)
 	case "rm", "remove":
 		return c.remove(commandArgs)
+	case "sync":
+		return c.sync(commandArgs)
 	case "cat":
 		return c.cat(commandArgs)
 	case "stat":
@@ -74,7 +94,7 @@ func (c *CLI) Run(args []string) error {
 	case "help", "--help", "-h":
 		return c.showHelp()
 	default:
-		return fmt.Errorf("unknown command: %s\nRun 'storage-cli help' for usage information", command)
+		return usagef("unknown command: %s\nRun 'storage-cli help' for usage information", command)
 	}
 }
 
@@ -85,333 +105,131 @@ func (c *CLI) showVersion() error {
 
 func (c *CLI) stat(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: storage-cli stat <bucket/object>")
+		return usagef("usage: storage-cli stat <bucket/object>")
 	}
-
-	remotePath := args[0]
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("path must be in format: bucket/object")
-	}
-
-	bucketName, objectKey := parts[0], parts[1]
-
-	url := fmt.Sprintf("%s/objects/%s/%s", c.config.ServerUrl, bucketName, objectKey)
-	resp, err := c.client.Head(url)
+	r, err := parseRemote(args[0])
 	if err != nil {
-		resp, err := c.client.Get(url)
-		if err != nil {
-			return fmt.Errorf("failed to get objects info: %w", err)
-		}
-		resp.Body.Close()
+		return err
+	}
+	if r.Key == "" {
+		return usagef("path must be in format: bucket/object")
 	}
 
+	resp, err := c.client.Head(c.objectURL(r.Bucket, r.Key))
+	if err != nil {
+		return fmt.Errorf("failed to get object info: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("object '%s' not found", r)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("object not found")
+		return fmt.Errorf("failed to get object info: HTTP %d", resp.StatusCode)
 	}
 
-	fmt.Printf("Object: %s/%s\n", bucketName, objectKey)
+	fmt.Printf("Object: %s\n", r)
 	fmt.Printf("Content-Type: %s\n", resp.Header.Get("Content-Type"))
 	fmt.Printf("Content-Length: %s\n", resp.Header.Get("Content-Length"))
 	fmt.Printf("ETag: %s\n", resp.Header.Get("ETag"))
+	fmt.Printf("SHA-256: %s\n", resp.Header.Get("X-Content-SHA256"))
 	fmt.Printf("Last-Modified: %s\n", resp.Header.Get("Last-Modified"))
-
 	return nil
 }
 
+// cat streams to stdout while hashing. Output can't be un-written, so a
+// checksum mismatch is reported after the fact via a non-zero exit code.
 func (c *CLI) cat(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: storage-cli stat <bucket/object>")
+		return usagef("usage: storage-cli cat <bucket/object>")
+	}
+	r, err := parseRemote(args[0])
+	if err != nil {
+		return err
+	}
+	if r.Key == "" {
+		return usagef("path must be in format: bucket/object")
 	}
 
-	remotePath := args[0]
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("path must be in format: bucket/object")
-	}
-
-	bucketName, objectKey := parts[0], parts[1]
-
-	url := fmt.Sprintf("%s/objects/%s/%s", c.config.ServerUrl, bucketName, objectKey)
-	resp, err := c.client.Get(url)
+	resp, err := c.client.Get(c.objectURL(r.Bucket, r.Key))
 	if err != nil {
 		return fmt.Errorf("failed to get object: %w", err)
 	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to get Object: %s", string(body))
-	}
-
-	_, err = io.Copy(os.Stdout, resp.Body)
-	return err
-}
-
-func (c *CLI) remove(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: storage-cli rm <bucket/object>")
-	}
-
-	remotePath := args[0]
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("path must be in format: bucket/object")
-	}
-
-	bucketName, objectKey := parts[0], parts[1]
-
-	if c.config.Verbose {
-		fmt.Printf("Removing object '%s/%s'...\n", bucketName, objectKey)
-	}
-
-	url := fmt.Sprintf("%s/objects/%s/%s", c.config.ServerUrl, bucketName, objectKey)
-	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to delete object: %w", err)
-	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to delete object: %s", string(body))
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("object '%s' not found", r)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return httpError(resp, "failed to get object")
 	}
 
-	fmt.Printf("Object '%s/%s' removed successfully.\n", bucketName, objectKey)
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(os.Stdout, h), resp.Body); err != nil {
+		return err
+	}
+	if want := resp.Header.Get("X-Content-SHA256"); want != "" && !strings.EqualFold(want, hexSum(h)) {
+		return fmt.Errorf("checksum mismatch for '%s' (output was already written)", r)
+	}
 	return nil
-
-}
-
-func (c *CLI) copy(args []string) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: storage-cli cp <source> <destination>\n" +
-			"Examples:\n" +
-			"  storage-cli cp file.txt mybucket/file.txt  # Upload local file\n" +
-			"  storage-cli cp mybucket/file.txt file.txt  # Download to local file")
-	}
-
-	source := args[0]
-	dest := args[1]
-
-	if strings.Contains(source, "/") && !strings.Contains(dest, "/") {
-		return c.downloadFile(source, dest)
-	} else if !strings.Contains(source, "/") && strings.Contains(dest, "/") {
-		return c.uploadFile(source, dest)
-	} else {
-		return fmt.Errorf("invalid copy operation. Use format: localfile bucket/object or bucket/object localfile")
-	}
-}
-
-func (c *CLI) uploadFile(localPath, remotePath string) error {
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("remote path must be in format: bucket/object")
-	}
-
-	bucketName, objectKey := parts[0], parts[1]
-
-	fileInfo, err := os.Stat(localPath)
-	if err != nil {
-		return fmt.Errorf("local file not found: %w", err)
-	}
-
-	if c.config.Verbose {
-		fmt.Printf("Uploading '%s' to '%s/%s' (%s)...\n",
-			localPath, bucketName, objectKey, formatSize(fileInfo.Size()))
-	}
-
-	file, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("failed to open local file: %w", err)
-	}
-	defer file.Close()
-
-	contentType := getContentType(localPath)
-
-	url := fmt.Sprintf("%s/objects/%s/%s", c.config.ServerUrl, bucketName, objectKey)
-	req, err := http.NewRequest("PUT", url, file)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", contentType)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to upload file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to upload file: %s", string(body))
-	}
-
-	fmt.Printf("File uploaded successfully to '%s/%s'.\n", bucketName, objectKey)
-	return nil
-}
-
-func (c *CLI) downloadFile(remotePath, localPath string) error {
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("remote path must be in format: bucket/object")
-	}
-
-	bucketName, objectKey := parts[0], parts[1]
-
-	if c.config.Verbose {
-		fmt.Printf("Downloading '%s/%s' to '%s'...\n", bucketName, objectKey, localPath)
-	}
-
-	url := fmt.Sprintf("%s/objects/%s/%s", c.config.ServerUrl, bucketName, objectKey)
-	resp, err := c.client.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to download file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to download file: %s", string(body))
-	}
-
-	localFile, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("failed to create local file: %w", err)
-	}
-	defer localFile.Close()
-
-	size, err := io.Copy(localFile, resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	fmt.Printf("File downloaded successfully to '%s' (%s).\n", localPath, formatSize(size))
-	return nil
-}
-
-func (c *CLI) list(args []string) error {
-	if len(args) == 0 {
-		return c.listBuckets()
-	}
-
-	bucketName := args[0]
-	return c.listObjects(bucketName)
-}
-
-func (c *CLI) listBuckets() error {
-	if c.config.Verbose {
-		fmt.Println("Listing buckets...")
-	}
-
-	url := fmt.Sprintf("%s/buckets", c.config.ServerUrl)
-	resp, err := c.client.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to list buckets: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to list buckets: %s", string(body))
-	}
-
-	var buckets []BucketInfo
-	if err := json.NewDecoder(resp.Body).Decode(&buckets); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(buckets) == 0 {
-		fmt.Println("No buckets found.")
-		return nil
-	}
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "BUCKET NAME\tCREATED")
-	fmt.Fprintln(w, "-----------\t-------")
-
-	for _, bucket := range buckets {
-		fmt.Fprintf(w, "%s\t%s\n", bucket.Name, bucket.Created.Format("2025-01-02 15:04:05"))
-	}
-
-	return w.Flush()
-}
-
-func (c *CLI) listObjects(bucketName string) error {
-	if c.config.Verbose {
-		fmt.Printf("Listing objects in bucket '%s'...\n", bucketName)
-	}
-
-	url := fmt.Sprintf("%s/objects/%s", c.config.ServerUrl, bucketName)
-	resp, err := c.client.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to list objects: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to list objects: %s", string(body))
-	}
-
-	var objects []ObjectInfo
-	if err := json.NewDecoder(resp.Body).Decode(&objects); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(objects) == 0 {
-		fmt.Printf("No objects found in bucket '%s'.\n", bucketName)
-		return nil
-	}
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "OBJECT KEY\tSIZE\tCONTENT TYPE\tLAST MODIFIED")
-	fmt.Fprintln(w, "----------\t----\t------------\t-------------")
-
-	for _, obj := range objects {
-		sizeStr := formatSize(obj.Size)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-			obj.Key, sizeStr, obj.ContentType,
-			obj.LastModified.Format("2006-01-02 15:04:05"))
-	}
-
-	return w.Flush()
 }
 
 func (c *CLI) makeBucket(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: storage-cli mb <bucket-name>")
+		return usagef("usage: storage-cli mb <bucket-name>")
 	}
+	bucketName := strings.TrimSuffix(strings.TrimPrefix(args[0], remoteScheme), "/")
 
-	bucketName := args[0]
+	c.debugf("Creating bucket '%s'...\n", bucketName)
 
-	if c.config.Verbose {
-		fmt.Printf("Creating bucket '%s'...\n", bucketName)
-	}
-
-	url := fmt.Sprintf("%s/buckets/%s", c.config.ServerUrl, bucketName)
-	req, err := http.NewRequest("PUT", url, nil)
+	req, err := http.NewRequest(http.MethodPut, c.bucketURL(bucketName), nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
-
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to create bucket: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to create bucket: %s", string(body))
+		return httpError(resp, "failed to create bucket")
 	}
 
-	fmt.Printf("Bucket '%s' created successfully.\n", bucketName)
+	c.infof("Bucket '%s' created successfully.\n", bucketName)
+	return nil
+}
+
+// removeBucket needs DELETE /buckets/{name} on the server. The server refuses
+// (409) if the bucket still holds objects, like `aws s3 rb` without --force.
+func (c *CLI) removeBucket(args []string) error {
+	if len(args) != 1 {
+		return usagef("usage: storage-cli rb <bucket-name>")
+	}
+	bucketName := strings.TrimSuffix(strings.TrimPrefix(args[0], remoteScheme), "/")
+	if bucketName == "" || strings.Contains(bucketName, "/") {
+		return usagef("rb takes a bucket name only (use 'rm -r' to delete objects)")
+	}
+
+	c.debugf("Removing bucket '%s'...\n", bucketName)
+
+	req, err := http.NewRequest(http.MethodDelete, c.bucketURL(bucketName), nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to remove bucket: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+	case http.StatusNotFound:
+		return fmt.Errorf("bucket '%s' not found", bucketName)
+	case http.StatusConflict:
+		return fmt.Errorf("bucket '%s' is not empty (delete its objects first: storage-cli rm -r %s)", bucketName, bucketName)
+	default:
+		return httpError(resp, "failed to remove bucket")
+	}
+
+	c.infof("Bucket '%s' removed.\n", bucketName)
 	return nil
 }
 
@@ -421,49 +239,45 @@ func (c *CLI) showHelp() error {
 USAGE:
     storage-cli [OPTIONS] COMMAND [ARGS...]
 
-OPTIONS:
+OPTIONS (must come before the command):
     --server URL    Storage server URL (default: %s)
     --verbose, -v   Enable verbose output
+    --quiet, -q     Only print errors (and command results such as ls/cat)
     --help, -h      Show this help message
 
 COMMANDS:
-    mb, makebucket <bucket>           Create a new bucket
-    ls, list [bucket]                 List buckets or objects in bucket
-    cp, copy <source> <dest>          Upload or download files
-    rm, remove <bucket/object>        Delete an object
-    cat <bucket/object>               Display object content
+    mb <bucket>                       Create a bucket
+    rb <bucket>                       Remove an empty bucket
+    ls [-r] [bucket[/prefix]]         List buckets, or objects (-r: recursive, flat)
+    cp [-r] <source> <dest>           Upload, download or copy; -r for directories/prefixes
+    mv [-r] <source> <dest>           Copy, then delete the source (only if the copy verified)
+    rm [-r] <bucket/key|prefix>       Delete an object, or everything under a prefix with -r
+    sync <source> <dest>              Transfer only new or changed files (size + MD5 ETag)
+    cat <bucket/object>               Print object content (SHA-256 verified)
     stat <bucket/object>              Show object information
-    version                           Show version information
-    help                              Show this help message
+    version | help
+
+    cp, mv, rm and sync also accept --dryrun to show what would happen.
+
+PATHS:
+    Local paths:  anything starting with ./ ../ or /, or that exists on disk.
+    Bucket paths: bucket/key, or s3://bucket/key to force remote.
+    For bucket-to-bucket copies, write the destination as s3://bucket/key.
+    Recursive commands treat prefixes as folders: 'logs' matches logs/..., not logs2/...
+
+EXIT CODES:
+    0 success    1 one or more operations failed    2 usage error
 
 EXAMPLES:
-    # Create a bucket
-    storage-cli mb my-bucket
-
-    # List all buckets
-    storage-cli ls
-
-    # List objects in a bucket
-    storage-cli ls my-bucket
-
-    # Upload a file
-    storage-cli cp local-file.txt my-bucket/remote-file.txt
-
-    # Download a file
-    storage-cli cp my-bucket/remote-file.txt downloaded-file.txt
-
-    # View file content
-    storage-cli cat my-bucket/readme.txt
-
-    # Get file information
-    storage-cli stat my-bucket/data.json
-
-    # Delete an object
-    storage-cli rm my-bucket/old-file.txt
-
-For more information, visit: https://github.com/yourusername/storage-cli
+    storage-cli mb logs
+    storage-cli cp -r ./var/log/app logs/app
+    storage-cli sync ./var/log/app logs/app          # archive only new/changed files
+    storage-cli ls -r logs/app
+    storage-cli cp -r logs/app ./restore
+    storage-cli mv logs/app/a.log s3://logs/old/a.log
+    storage-cli rm -r --dryrun logs/app
+    storage-cli rb logs
 `, version, defaultServerUrl)
-
 	return nil
 }
 
@@ -520,6 +334,8 @@ func main() {
 		serverURL = flag.String("server", defaultServerUrl, "Storage server URL")
 		verbose   = flag.Bool("verbose", false, "Enable verbose output")
 		v         = flag.Bool("v", false, "Enable verbose output (short form)")
+		quiet     = flag.Bool("quiet", false, "Only print errors")
+		q         = flag.Bool("q", false, "Only print errors (short form)")
 		help      = flag.Bool("help", false, "Show help message")
 		h         = flag.Bool("h", false, "Show help message (short form)")
 	)
@@ -527,8 +343,9 @@ func main() {
 	flag.Parse()
 
 	config := &Config{
-		ServerUrl: *serverURL,
+		ServerUrl: strings.TrimRight(*serverURL, "/"),
 		Verbose:   *verbose || *v,
+		Quiet:     *quiet || *q,
 	}
 
 	cli := NewCLI(config)
@@ -538,9 +355,12 @@ func main() {
 		return
 	}
 
-	args := flag.Args()
-	if err := cli.Run(args); err != nil {
+	if err := cli.Run(flag.Args()); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		var ue *usageError
+		if errors.As(err, &ue) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }

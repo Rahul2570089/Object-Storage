@@ -15,25 +15,43 @@ func NewStorageServer(storage *ObjectStorage) *StorageServer {
 	return &StorageServer{storage: storage}
 }
 
-func (s *StorageServer) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (s *StorageServer) handleBucket(w http.ResponseWriter, r *http.Request) {
 	bucketName := strings.TrimPrefix(r.URL.Path, "/buckets/")
 	if bucketName == "" {
 		http.Error(w, "Bucket name required", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.storage.CreateBucket(bucketName); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	switch r.Method {
+	case http.MethodPut:
+		err := s.storage.CreateBucket(bucketName)
+		switch {
+		case errors.Is(err, ErrInvalidName):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]string{"status": "bucket created"})
+		}
+	case http.MethodDelete:
+		err := s.storage.DeleteBucket(bucketName)
+		switch {
+		case errors.Is(err, ErrInvalidName):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, ErrBucketNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, ErrBucketNotEmpty):
+			http.Error(w, err.Error(), http.StatusConflict)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	default:
+		w.Header().Set("Allow", "PUT, DELETE")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
-
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "bucket created"})
 }
 
 func (s *StorageServer) handleListBuckets(w http.ResponseWriter, r *http.Request) {
@@ -118,8 +136,10 @@ func (s *StorageServer) handleGetObject(w http.ResponseWriter, r *http.Request) 
 	}
 	defer file.Close()
 
-	w.Header().Set("Content-Type", metadata.ContentType)
 	w.Header().Set("ETag", metadata.ETag)
+	if metadata.SHA256 != "" {
+		w.Header().Set("X-Content-SHA256", metadata.SHA256)
+	}
 	http.ServeContent(w, r, "", metadata.LastModified, file)
 }
 
@@ -137,9 +157,19 @@ func (s *StorageServer) handleListObjects(w http.ResponseWriter, r *http.Request
 	}
 
 	objects, err := s.storage.ListObjects(bucketName)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrInvalidName):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case errors.Is(err, ErrBucketNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	case err != nil:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if objects == nil {
+		objects = []ObjectMetadata{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
